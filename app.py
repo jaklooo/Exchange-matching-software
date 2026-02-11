@@ -675,28 +675,46 @@ if cap_file and app_file:
         st.session_state.capacities_step1 = None
         st.session_state.working_sheet = None
         st.session_state.result_table = None
+        st.session_state.iteration = 1
+        st.session_state.finished = False
+        st.session_state.auto_run = False
 
     step_container = st.container()
 
     with step_container:
-        if st.session_state.step == 1:
+        if st.session_state.finished:
+            st.balloons()
+            st.success("🎉 Prepočet dokončený! Rozraďovanie je hotové.")
+            st.session_state.auto_run = False
+            run_step = False
+        elif st.session_state.step == 1:
             st.subheader("Krok 1 – Výpočet reálnej obsadenosti")
-            run_step = st.button("Spustiť krok 1", type="primary")
+            col_btn1, col_btn2 = st.columns([1, 1])
+            with col_btn1:
+                run_step = st.button("Spustiť krok 1", type="primary")
+            with col_btn2:
+                if st.button("🚀 Spustiť všetky kroky automaticky", type="secondary"):
+                    st.session_state.auto_run = True
+                    run_step = True
         elif st.session_state.step == 2:
             st.subheader("Krok 2 – Filter duplicít v pracovnom hárku")
-            run_step = st.button("Spustiť krok 2", type="primary")
+            run_step = st.button("Spustiť krok 2", type="primary") or st.session_state.auto_run
         elif st.session_state.step == 3:
-            st.subheader("Krok 3 – Prečíslovanie poradia podľa ID code")
-            run_step = st.button("Spustiť krok 3", type="primary")
+            iteration_label = f" (iterácia {st.session_state.iteration})" if st.session_state.iteration > 1 else ""
+            st.subheader(f"Krok 3 – Prečíslovanie poradia podľa ID code{iteration_label}")
+            run_step = st.button("Spustiť krok 3", type="primary") or st.session_state.auto_run
         elif st.session_state.step == 4:
-            st.subheader("Krok 4 – Výber študentov podľa kapacity")
-            run_step = st.button("Spustiť krok 4", type="primary")
+            iteration_label = f" (iterácia {st.session_state.iteration})" if st.session_state.iteration > 1 else ""
+            st.subheader(f"Krok 4 – Výber študentov podľa kapacity{iteration_label}")
+            run_step = st.button("Spustiť krok 4", type="primary") or st.session_state.auto_run
         elif st.session_state.step == 5:
-            st.subheader("Krok 5 – Aktualizácia nominácií")
-            run_step = st.button("Spustiť krok 5", type="primary")
+            iteration_label = f" (iterácia {st.session_state.iteration})" if st.session_state.iteration > 1 else ""
+            st.subheader(f"Krok 5 – Aktualizácia nominácií{iteration_label}")
+            run_step = st.button("Spustiť krok 5", type="primary") or st.session_state.auto_run
         else:
-            st.subheader("Krok 6 – Riešenie cyklov duplicít")
-            run_step = st.button("Spustiť krok 6", type="primary")
+            iteration_label = f" (iterácia {st.session_state.iteration})" if st.session_state.iteration > 1 else ""
+            st.subheader(f"Krok 6 – Riešenie cyklov duplicít{iteration_label}")
+            run_step = st.button("Spustiť krok 6", type="primary") or st.session_state.auto_run
 
     if run_step:
         if st.session_state.step == 1:
@@ -713,6 +731,8 @@ if cap_file and app_file:
             st.session_state.step = 2
 
             st.success("Krok 1 hotový. Kapacity boli upravené podľa reálnych nominácií.")
+            if st.session_state.auto_run:
+                st.rerun()
         elif st.session_state.step == 2:
             try:
                 st.session_state.working_sheet = filter_duplicates_by_priority(
@@ -727,6 +747,8 @@ if cap_file and app_file:
             st.success(
                 "Krok 2 hotový. Duplicity v pracovnom hárku boli odfiltrované podľa priority."
             )
+            if st.session_state.auto_run:
+                st.rerun()
         elif st.session_state.step == 3:
             try:
                 st.session_state.working_sheet = normalize_ordering_by_id_code(
@@ -741,6 +763,8 @@ if cap_file and app_file:
             st.success(
                 "Krok 3 hotový. Poradie bolo prečíslované pre každé ID code."
             )
+            if st.session_state.auto_run:
+                st.rerun()
         elif st.session_state.step == 4:
             try:
                 st.session_state.result_table = build_result_table(
@@ -757,6 +781,8 @@ if cap_file and app_file:
             st.success(
                 "Krok 4 hotový. Výsledná tabuľka bola vytvorená podľa kapacít a poradia."
             )
+            if st.session_state.auto_run:
+                st.rerun()
         elif st.session_state.step == 5:
             try:
                 (
@@ -775,7 +801,10 @@ if cap_file and app_file:
             st.success(
                 "Krok 5 hotový. Nominácie boli aktualizované podľa prijatých študentov."
             )
+            if st.session_state.auto_run:
+                st.rerun()
         else:
+            rows_before = len(st.session_state.working_sheet)
             try:
                 st.session_state.working_sheet = resolve_duplicate_cycles(
                     st.session_state.working_sheet,
@@ -787,9 +816,20 @@ if cap_file and app_file:
                 st.error(str(exc))
                 st.stop()
 
-            st.success(
-                "Krok 6 hotový. Cykly duplicít boli vyriešené."
-            )
+            rows_after = len(st.session_state.working_sheet)
+            changes_made = rows_before != rows_after
+
+            if changes_made:
+                st.success(
+                    f"Krok 6 hotový. Vymazaných {rows_before - rows_after} riadkov. Pokračujem ďalšou iteráciou..."
+                )
+                st.session_state.step = 3
+                st.session_state.iteration += 1
+                if st.session_state.auto_run:
+                    st.rerun()
+            else:
+                st.session_state.finished = True
+                st.rerun()
 
     if st.session_state.capacities_step1 is not None:
         st.markdown("## Výstupy – prehľad hárkov")
