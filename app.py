@@ -353,27 +353,238 @@ def update_nominations(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     nom_col = get_col(app_cols, "NOMINOVÁN")
     uk_col = get_col(app_cols, "Číslo UK")
+    id_col = get_col(app_cols, "ID code")
 
-    if not nom_col or not uk_col:
-        raise ValueError("Chýbajú povinné stĺpce: 'NOMINOVÁN', 'Číslo UK'.")
+    if not nom_col or not uk_col or not id_col:
+        raise ValueError("Chýbajú povinné stĺpce: 'NOMINOVÁN', 'Číslo UK', 'ID code'.")
 
     working_updated = working_df.copy()
     result_updated = result_df.copy()
 
-    if uk_col not in result_df.columns:
-        raise ValueError(f"Stĺpec '{uk_col}' sa nenašiel vo výslednej tabuľke.")
+    if uk_col not in result_df.columns or id_col not in result_df.columns:
+        raise ValueError(f"Stĺpce '{uk_col}' alebo '{id_col}' sa nenašli vo výslednej tabuľke.")
 
-    accepted_uk = set(result_df[uk_col].dropna().astype(str).unique())
+    # Vytvor množinu prijatých kombinácií (Číslo UK, ID code)
+    accepted_pairs = set()
+    for _, row in result_df.iterrows():
+        uk_val = str(row[uk_col]) if pd.notna(row[uk_col]) else ""
+        id_val = str(row[id_col]) if pd.notna(row[id_col]) else ""
+        if uk_val and id_val:
+            accepted_pairs.add((uk_val, id_val))
 
+    # Aktualizuj NOMINOVÁN len pre konkrétne kombinácie (Číslo UK + ID code)
     if nom_col in working_updated.columns:
-        working_updated[nom_col] = working_updated[uk_col].astype(str).apply(
-            lambda x: "ANO" if x in accepted_uk else "NE"
-        )
+        def check_nomination(row):
+            uk_val = str(row[uk_col]) if pd.notna(row[uk_col]) else ""
+            id_val = str(row[id_col]) if pd.notna(row[id_col]) else ""
+            return "ANO" if (uk_val, id_val) in accepted_pairs else "NE"
+        
+        working_updated[nom_col] = working_updated.apply(check_nomination, axis=1)
 
     if nom_col in result_updated.columns:
         result_updated[nom_col] = "ANO"
 
     return working_updated, result_updated
+
+
+def resolve_duplicate_cycles(
+    working_df: pd.DataFrame,
+    capacities_df: pd.DataFrame,
+    cap_cols: Dict[str, str],
+    app_cols: Dict[str, str],
+) -> pd.DataFrame:
+    """Krok 6: Analýza a riešenie cyklov duplicít.
+    
+    Príklad cyklu:
+    - Žiak A: ŠkolaA (Priorita 1, Poradie 2, NE), ŠkolaB (Priorita 2, Poradie 1, ANO)
+    - Žiak B: ŠkolaA (Priorita 2, Poradie 1, ANO), ŠkolaB (Priorita 1, Poradie 2, NE)
+    
+    Cyklus: A má NE na ŠkoleA → B má ANO na ŠkoleA → B má NE na ŠkoleB → A má ANO na ŠkoleB → späť
+    """
+    uk_col = get_col(app_cols, "Číslo UK")
+    nom_col = get_col(app_cols, "NOMINOVÁN")
+    id_col = get_col(app_cols, "ID code")
+    order_col = get_col(app_cols, "Pořadí")
+    prio_col = get_col(app_cols, "PRIORITA")
+    cap_id_col = get_col(cap_cols, "ID code")
+    cap_all_col = get_col(cap_cols, "ALL")
+
+    if not uk_col or not nom_col or not id_col or not order_col:
+        raise ValueError(
+            "Chýbajú povinné stĺpce pre krok 6: 'Číslo UK', 'NOMINOVÁN', 'ID code', 'Pořadí'."
+        )
+
+    df = working_df.copy()
+    df[nom_col] = df[nom_col].astype(str).str.strip().str.upper()
+    df[order_col] = pd.to_numeric(df[order_col], errors="coerce")
+    if prio_col:
+        df[prio_col] = pd.to_numeric(df[prio_col], errors="coerce")
+
+    capacity_map = capacities_df.set_index(cap_id_col)
+
+    def get_capacity(code):
+        if cap_all_col and cap_all_col in capacity_map.columns and code in capacity_map.index:
+            return int(pd.to_numeric(capacity_map.loc[code, cap_all_col], errors="coerce") or 0)
+        return 0
+
+    def find_cycles():
+        """Nájde všetky cykly medzi študentmi."""
+        # Vytvor graf: pre každého študenta s duplicitou (ANO + NE)
+        # hrana vedie od študenta s NE na škole X k študentovi s ANO na tej istej škole X
+        
+        # Nájdi študentov s ANO aj NE
+        students_with_both = set()
+        for uk in df[uk_col].unique():
+            uk_rows = df[df[uk_col] == uk]
+            has_ano = (uk_rows[nom_col] == "ANO").any()
+            has_ne = (uk_rows[nom_col] == "NE").any()
+            if has_ano and has_ne:
+                students_with_both.add(uk)
+        
+        if not students_with_both:
+            return []
+        
+        # Vytvor graf prepojení
+        # edge: študent_s_NE -> študent_s_ANO (na rovnakej škole)
+        edges = {}  # uk -> set of (other_uk, id_code)
+        
+        for uk in students_with_both:
+            uk_rows = df[df[uk_col] == uk]
+            ne_rows = uk_rows[uk_rows[nom_col] == "NE"]
+            edges[uk] = set()
+            
+            for _, ne_row in ne_rows.iterrows():
+                school = ne_row[id_col]
+                # Nájdi iných študentov s ANO na tej istej škole
+                school_anos = df[(df[id_col] == school) & (df[nom_col] == "ANO") & (df[uk_col] != uk)]
+                for _, ano_row in school_anos.iterrows():
+                    other_uk = ano_row[uk_col]
+                    if other_uk in students_with_both:
+                        edges[uk].add((other_uk, school))
+        
+        # DFS pre hľadanie cyklov
+        def find_cycle_from(start):
+            visited = set()
+            path = []
+            path_set = set()
+            
+            def dfs(current):
+                if current in path_set:
+                    # Našli sme cyklus
+                    cycle_start = path.index(current)
+                    return path[cycle_start:]
+                if current in visited:
+                    return None
+                
+                visited.add(current)
+                path.append(current)
+                path_set.add(current)
+                
+                for next_uk, school in edges.get(current, []):
+                    result = dfs(next_uk)
+                    if result:
+                        return result
+                
+                path.pop()
+                path_set.remove(current)
+                return None
+            
+            return dfs(start)
+        
+        cycles = []
+        found_in_cycle = set()
+        for uk in students_with_both:
+            if uk not in found_in_cycle:
+                cycle = find_cycle_from(uk)
+                if cycle and len(cycle) >= 2:
+                    cycles.append(cycle)
+                    found_in_cycle.update(cycle)
+        
+        return cycles
+
+    def would_all_get_nominated(cycle_uks):
+        """Test: ak by ANO záznamy zmizli, dostali by sa všetky NE na nomináciu?"""
+        test_df = df.copy()
+        
+        # Odstráň ANO záznamy pre študentov v cykle
+        for uk in cycle_uks:
+            ano_idx = test_df[(test_df[uk_col] == uk) & (test_df[nom_col] == "ANO")].index
+            test_df = test_df.drop(ano_idx)
+        
+        # Skontroluj či by sa NE záznamy dostali
+        for uk in cycle_uks:
+            ne_rows = test_df[test_df[uk_col] == uk]
+            # Vezmi NE s najnižšou prioritou (najdôležitejšiu školu)
+            if prio_col:
+                ne_rows = ne_rows.sort_values(prio_col)
+            
+            for _, ne_row in ne_rows.iterrows():
+                school = ne_row[id_col]
+                order = ne_row[order_col]
+                capacity = get_capacity(school)
+                
+                # Koľko ľudí má lepšie poradie na tejto škole?
+                school_group = test_df[test_df[id_col] == school]
+                better_count = (school_group[order_col] < order).sum()
+                
+                if better_count >= capacity:
+                    return False
+                break  # Stačí skontrolovať prvú (najvyššia priorita)
+        
+        return True
+
+    rows_to_delete = set()
+    cycles = find_cycles()
+    
+    for cycle in cycles:
+        cycle_uks = set(cycle)
+        
+        if would_all_get_nominated(cycle_uks):
+            # Všetci by sa dostali → zmaž ANO záznamy (prepusti miesta)
+            for uk in cycle_uks:
+                ano_idx = df[(df[uk_col] == uk) & (df[nom_col] == "ANO")].index
+                rows_to_delete.update(ano_idx)
+        else:
+            # Nie všetci by sa dostali → zmaž NE záznamy (zachovaj status quo)
+            for uk in cycle_uks:
+                ne_idx = df[(df[uk_col] == uk) & (df[nom_col] == "NE")].index
+                rows_to_delete.update(ne_idx)
+    
+    # Spracuj aj študentov mimo cyklov (možnosť 1 z pôvodného popisu)
+    processed_uks = set()
+    for cycle in cycles:
+        processed_uks.update(cycle)
+    
+    for uk in df[uk_col].unique():
+        if uk in processed_uks:
+            continue
+        
+        uk_rows = df[df[uk_col] == uk]
+        ano_rows = uk_rows[uk_rows[nom_col] == "ANO"]
+        ne_rows = uk_rows[uk_rows[nom_col] == "NE"]
+        
+        if ano_rows.empty or ne_rows.empty:
+            continue
+        
+        # Študent má ANO aj NE, ale nie je v cykle
+        # Skontroluj či ANO študenti na školách kde má NE majú duplicity
+        for _, ne_row in ne_rows.iterrows():
+            school = ne_row[id_col]
+            school_anos = df[(df[id_col] == school) & (df[nom_col] == "ANO") & (df[uk_col] != uk)]
+            
+            any_has_duplicate = False
+            for _, ano_row in school_anos.iterrows():
+                other_uk = ano_row[uk_col]
+                if len(df[df[uk_col] == other_uk]) > 1:
+                    any_has_duplicate = True
+                    break
+            
+            if not any_has_duplicate:
+                # Žiadny ANO na tej škole nemá duplicitu → zmaž NE
+                rows_to_delete.add(ne_row.name)
+
+    result = df.drop(index=list(rows_to_delete)).reset_index(drop=True)
+    return result
 
 
 left, right = st.columns(2)
@@ -480,9 +691,12 @@ if cap_file and app_file:
         elif st.session_state.step == 4:
             st.subheader("Krok 4 – Výber študentov podľa kapacity")
             run_step = st.button("Spustiť krok 4", type="primary")
-        else:
+        elif st.session_state.step == 5:
             st.subheader("Krok 5 – Aktualizácia nominácií")
             run_step = st.button("Spustiť krok 5", type="primary")
+        else:
+            st.subheader("Krok 6 – Riešenie cyklov duplicít")
+            run_step = st.button("Spustiť krok 6", type="primary")
 
     if run_step:
         if st.session_state.step == 1:
@@ -543,7 +757,7 @@ if cap_file and app_file:
             st.success(
                 "Krok 4 hotový. Výsledná tabuľka bola vytvorená podľa kapacít a poradia."
             )
-        else:
+        elif st.session_state.step == 5:
             try:
                 (
                     st.session_state.working_sheet,
@@ -557,8 +771,24 @@ if cap_file and app_file:
                 st.error(str(exc))
                 st.stop()
 
+            st.session_state.step = 6
             st.success(
                 "Krok 5 hotový. Nominácie boli aktualizované podľa prijatých študentov."
+            )
+        else:
+            try:
+                st.session_state.working_sheet = resolve_duplicate_cycles(
+                    st.session_state.working_sheet,
+                    st.session_state.capacities_step1,
+                    cap_map,
+                    app_map,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                st.stop()
+
+            st.success(
+                "Krok 6 hotový. Cykly duplicít boli vyriešené."
             )
 
     if st.session_state.capacities_step1 is not None:
